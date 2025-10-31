@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>JET Filter — Maintainable Weep Hole (Technical SVG Animation)</title>
+  <style>
+    :root{
+      --bg:#0b1220;
+      --grid:#101a30;
+      --line:#6eb1ff;
+      --muted:#2a3b5f;
+      --accent:#9dd0ff;
+      --water:#69c2ff;
+      --success:#55d17a;
+      --warning:#ffd166;
+    }
+    html,body{height:100%;margin:0;background:var(--bg);color:#cfe6ff;font-family:system-ui,Arial,sans-serif;}
+    .bp{stroke:var(--line);fill:none;stroke-width:2;}
+    .bp-dashed{stroke-dasharray:6 6;}
+    .label{fill:#bfe3ff;font-size:12px;font-weight:600;}
+    .drop{fill:var(--water);opacity:.95;}
+    /* Fallback (JS drives motion) */
+    @keyframes dripDown{from{transform:translateY(0);opacity:1} to{transform:translateY(150px);opacity:0}}
+    .drop{transform-box:fill-box; transform-origin:center;}
+  </style>
+</head>
+<body>
+<svg viewBox="0 0 900 520">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0 L10 5 L0 10 Z" fill="var(--accent)"/>
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="900" height="520" fill="#0c1426"/>
+
+  <!-- Retaining wall -->
+  <rect x="160" y="120" width="500" height="320" fill="#0f1d34" stroke="var(--line)" stroke-width="2"/>
+  <text x="410" y="112" class="label" text-anchor="middle">Reinforced Retaining Wall</text>
+
+  <!-- Backfill side -->
+  <rect x="40" y="140" width="120" height="300" fill="#0e1a31" stroke="var(--muted)" stroke-width="2"/>
+  <text x="100" y="132" class="label" text-anchor="middle">Backfill / Hydrostatic Pressure</text>
+
+  <!-- Rain + Water table (slow rise; stops at weep height) -->
+  <g id="rain"></g>
+  <rect id="waterLevel" x="40" y="440" width="120" height="0" fill="#2a6fb9" opacity="0.35"/>
+
+  <!-- Weep hole through wall -->
+  <rect x="160" y="260" width="500" height="40" class="bp" fill="none"/>
+  <text x="410" y="252" class="label" text-anchor="middle">Weep Hole Path</text>
+
+  <!-- JET Filter cone (into wall) -->
+  <g id="filter">
+    <!-- Front faceplate flush to wall -->
+    <rect x="660" y="245" width="4" height="70" fill="var(--line)"/>
+    <!-- Cone goes into wall -->
+    <path d="M660 245 L580 270 L580 290 L660 315 Z" fill="none" stroke="var(--line)" stroke-width="2"/>
+    <path class="cartridge" d="M660 252 L600 270 L600 290 L660 308 Z" fill="none" stroke="var(--accent)" stroke-width="2"/>
+    <text x="620" y="235" class="label" text-anchor="middle">JET Filter (Cone Into Wall)</text>
+  </g>
+
+  <!-- Outflow front side -->
+  <path d="M660 280 L820 280" class="bp"/>
+  <text x="780" y="270" class="label">Front Side Drainage</text>
+
+  <!-- Water flow guide -->
+  <path d="M80 280 L160 280 L660 280 L820 280" class="bp-dashed" stroke="var(--line)" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- Hydrostatic Pressure label -->
+  <text x="80" y="220" class="label">Hydrostatic Pressure (Behind Wall)</text>
+
+  <!-- Particles only (no blue path fill) -->
+  <g id="inflow"></g>
+  <g id="drops"></g>
+
+  <!-- Ground line for visual reference -->
+  <line x1="640" y1="430" x2="840" y2="430" stroke="#2a3b5f" stroke-width="2"/>
+</svg>
+<script>
+// --- Rain -> Slow Water Table Rise (stop at weep) -> Inflow that starts at BACK and ADVANCES -> Drips ---
+
+const rainLayer   = document.getElementById('rain');
+const waterRect   = document.getElementById('waterLevel');
+const inflowLayer = document.getElementById('inflow');
+const dropsLayer  = document.getElementById('drops');
+
+// Geometry
+const BACKFILL = {x:40, y:140, w:120, h:300};
+const BACKFILL_BOTTOM = BACKFILL.y + BACKFILL.h; // 440
+const WEEP_Y = 280;                               // tunnel centerline (weep height)
+const FACE_X = 662;                               // wall face (faceplate)
+const DRIP_OFFSET = 14;                           // slight outward for visibility
+const OUTLET_X = FACE_X + DRIP_OFFSET;
+const OUTLET_Y = WEEP_Y;
+const FALL = 160;                                 // drip fall distance
+
+// Particle path
+const START_X = 80;   // behind-wall side
+const END_X   = FACE_X;
+const FLOW_Y  = WEEP_Y;
+
+// State
+let waterHeight = 0;                               // from bottom up
+const WEEP_THRESHOLD = BACKFILL_BOTTOM - WEEP_Y;   // ≈160px to reach weep height
+let inflowEnabled = false;                         // turns true at threshold
+let filling = true;                                // rain contributes until threshold
+let inflowStartTime = null;                        // when particles are armed to start at back
+
+// Config
+const NUM_RAIN   = 25;  // rainfall streaks
+const NUM_INFLOW = 28;  // particles in tunnel
+const INFLOW_STAGGER = 180; // ms between particle starts after enable
+
+function getCSS(varName, fallback){
+  const v = getComputedStyle(document.documentElement).getPropertyValue(varName).trim();
+  return v || fallback;
+}
+
+// --- Rain
+function seedRain(){
+  rainLayer.innerHTML = '';
+  const now = performance.now();
+  for (let i = 0; i < NUM_RAIN; i++) {
+    const d = document.createElementNS('http://www.w3.org/2000/svg','line');
+    const x  = BACKFILL.x + Math.random()*BACKFILL.w;
+    const len = 10 + Math.random()*8;
+    d.setAttribute('x1', x);
+    d.setAttribute('y1', BACKFILL.y - 50);
+    d.setAttribute('x2', x);
+    d.setAttribute('y2', BACKFILL.y - 50 + len);
+    d.setAttribute('stroke', getCSS('--water', '#69c2ff'));
+    d.setAttribute('stroke-width', '2');
+    const speed = 180 + Math.random()*80; // slower to make water table rise slowly
+    d.dataset.t0 = (now + Math.random()*500).toString();
+    d.dataset.speed = speed.toString();
+    d.dataset.len = len.toString();
+    rainLayer.appendChild(d);
+  }
+}
+
+// Water table rise (slow) and STOP at threshold
+function updateWaterLevel(dy){
+  if (!filling) return;
+  waterHeight = Math.min(WEEP_THRESHOLD, waterHeight + dy);
+  const y = BACKFILL_BOTTOM - waterHeight;
+  waterRect.setAttribute('y', y);
+  waterRect.setAttribute('height', waterHeight);
+  if (waterHeight >= WEEP_THRESHOLD) {
+    // Arm the inflow to start from the BACK of the tunnel and move forward
+    inflowEnabled = true;
+    filling = false;
+    inflowStartTime = performance.now();
+    // Reset each particle's start time so it begins at START_X and progresses forward
+    const particles = inflowLayer.querySelectorAll('circle');
+    particles.forEach((p, i) => {
+      const T = +p.dataset.period || (3500 + Math.random()*2500);
+      p.dataset.period = T.toString();
+      p.dataset.t0 = (inflowStartTime + i*INFLOW_STAGGER).toString(); // staggered launch
+      p.setAttribute('cx', START_X);
+      p.setAttribute('opacity','0.35'); // wakes up a bit on start
+    });
+  }
+}
+
+// --- Inflow particles (pre-seeded but parked until enabled)
+function seedInflow(){
+  inflowLayer.innerHTML = '';
+  const now = performance.now();
+  for (let i = 0; i < NUM_INFLOW; i++) {
+    const p = document.createElementNS('http://www.w3.org/2000/svg','circle');
+    p.setAttribute('r', 2.4 + (i%2)*0.5);
+    p.setAttribute('fill', getCSS('--water', '#69c2ff'));
+    const jy = (Math.random()*10 - 5);
+    p.dataset.y = (FLOW_Y + jy).toString();
+    const period = 3500 + Math.random()*2500; // 3.5s - 6s to cross (kept, but t0 will be reset on enable)
+    // Preload t0 but it will be overwritten when inflow is enabled
+    p.dataset.t0 = (now + 9999999).toString(); // far future so they don't move yet
+    p.dataset.period = period.toString();
+    p.dataset.x0 = START_X.toString();
+    p.dataset.x1 = END_X.toString();
+    p.dataset.lastCycle = '-1';
+    // Park them visually at the back
+    p.setAttribute('cx', START_X);
+    p.setAttribute('cy', FLOW_Y + jy);
+    p.setAttribute('opacity', '0.2');
+    inflowLayer.appendChild(p);
+  }
+}
+
+// --- Drips (spawn when a particle reaches the faceplate)
+function spawnDrip(t){
+  const c = document.createElementNS('http://www.w3.org/2000/svg','circle');
+  const jitterX = (Math.random()*10 - 5);
+  c.setAttribute('cx', OUTLET_X + jitterX);
+  c.setAttribute('cy', OUTLET_Y);
+  c.setAttribute('r', 3 + Math.random()*1.5);
+  c.setAttribute('fill', getCSS('--water', '#69c2ff'));
+  const period = 2200 + Math.random()*2200;           // 2.2s - 4.4s fall
+  c.dataset.t0 = t.toString();
+  c.dataset.period = period.toString();
+  dropsLayer.appendChild(c);
+}
+
+let lastTime = null;
+function animate(time){
+  if (lastTime === null) lastTime = time;
+  const dt = (time - lastTime) / 1000;  // seconds
+  lastTime = time;
+
+  // --- RAIN (adds to table until threshold)
+  const rain = rainLayer.querySelectorAll('line');
+  rain.forEach(r => {
+    const t0 = +r.dataset.t0;
+    const speed = +r.dataset.speed;
+    const len = +r.dataset.len;
+    const elapsed = (time - t0) / 1000;
+    if (elapsed < 0) return;
+    const y1 = BACKFILL.y - 50 + elapsed * speed;
+    const y2 = y1 + len;
+    r.setAttribute('y1', y1);
+    r.setAttribute('y2', y2);
+    if (y2 >= BACKFILL_BOTTOM) {
+      if (filling) updateWaterLevel(0.25 + Math.random()*0.15); // slow rise
+      const now = performance.now();
+      r.dataset.t0 = (now + Math.random()*400).toString();
+      r.setAttribute('y1', BACKFILL.y - 50);
+      r.setAttribute('y2', BACKFILL.y - 50 + len);
+    }
+  });
+
+  // --- Inflow particles (move only once enabled, starting at the back with stagger)
+  const inflow = inflowLayer.querySelectorAll('circle');
+  inflow.forEach((p, idx) => {
+    const t0 = +p.dataset.t0;
+    const T  = +p.dataset.period;
+    const x0 = +p.dataset.x0;
+    const x1 = +p.dataset.x1;
+    const y  = +p.dataset.y;
+
+    if (!inflowEnabled) {
+      // parked until water hits weep height
+      p.setAttribute('cx', x0);
+      p.setAttribute('cy', y);
+      p.setAttribute('opacity', '0.2');
+      return;
+    }
+
+    let raw  = (time - t0) / T;
+    if (raw < 0) return;                 // not launched yet (stagger)
+    const cycle = Math.floor(raw);
+    let phase = raw - cycle;             // 0..1
+
+    // move across the tunnel toward faceplate
+    const eased = phase < 0.5 ? 2*phase*phase : -1 + (4 - 2*phase)*phase;
+    const x = x0 + (x1 - x0) * eased;
+    p.setAttribute('cx', x);
+    p.setAttribute('cy', y);
+    const near = Math.max(0, Math.min(1, (x - (x1-80)) / 80));
+    p.setAttribute('opacity', (0.6 + 0.4*near).toFixed(2));
+
+    // Spawn ONE straight-down drip per cycle when the particle reaches the face
+    const lastCycle = +p.dataset.lastCycle;
+    if (phase >= 0.92 && cycle !== lastCycle) {
+      p.dataset.lastCycle = String(cycle);
+      spawnDrip(time);
+    }
+  });
+
+  // --- DRIPS: straight down, then remove
+  const drops = dropsLayer.querySelectorAll('circle');
+  drops.forEach(c => {
+    const t0 = +c.dataset.t0;
+    const T  = +c.dataset.period;
+    const ph = (time - t0) / T;
+    if (ph < 0) return;
+    if (ph >= 1) { c.remove(); return; }
+    const y = OUTLET_Y + ph * FALL;
+    c.setAttribute('cy', y);
+    // keep x fixed (vertical)
+    const op = ph < 0.9 ? 1 : 1 - (ph - 0.9)/0.1;
+    c.setAttribute('opacity', Math.max(0, op).toFixed(2));
+  });
+
+  requestAnimationFrame(animate);
+}
+
+function init(){
+  seedRain();
+  seedInflow();
+  requestAnimationFrame(animate);
+}
+init();
+</script>
+</body>
+</html>
+
+
